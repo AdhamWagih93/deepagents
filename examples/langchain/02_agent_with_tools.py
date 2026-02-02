@@ -19,7 +19,7 @@ load_dotenv()
 @tool
 def calculator(expression: str) -> str:
     """
-    Evaluate a mathematical expression.
+    Evaluate a mathematical expression safely.
     
     Args:
         expression: A mathematical expression as a string (e.g., "2 + 2")
@@ -28,7 +28,35 @@ def calculator(expression: str) -> str:
         The result of the calculation
     """
     try:
-        result = eval(expression)
+        # Use a safe subset of operations
+        import ast
+        import operator
+        
+        # Allowed operators for safe evaluation
+        ops = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.Mod: operator.mod,
+            ast.USub: operator.neg,
+        }
+        
+        def eval_expr(node):
+            if isinstance(node, ast.Constant):  # Python 3.8+
+                return node.value
+            elif isinstance(node, ast.Num):  # Fallback for older Python
+                return node.n
+            elif isinstance(node, ast.BinOp):
+                return ops[type(node.op)](eval_expr(node.left), eval_expr(node.right))
+            elif isinstance(node, ast.UnaryOp):
+                return ops[type(node.op)](eval_expr(node.operand))
+            else:
+                raise ValueError(f"Unsupported operation: {type(node).__name__}")
+        
+        node = ast.parse(expression, mode='eval')
+        result = eval_expr(node.body)
         return f"The result is: {result}"
     except Exception as e:
         return f"Error calculating: {str(e)}"

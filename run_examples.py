@@ -7,6 +7,7 @@ This script helps you easily run any example in the playground.
 
 import sys
 import os
+import subprocess
 from pathlib import Path
 
 
@@ -50,46 +51,42 @@ EXAMPLES = {
 }
 
 
+def build_example_map():
+    """Build a mapping from numbers to examples."""
+    example_map = {}
+    num = 1
+    
+    for category in ["langchain", "langgraph", "deepagents"]:
+        for key in sorted(EXAMPLES[category].keys()):
+            example_map[num] = EXAMPLES[category][key]
+            num += 1
+    
+    return example_map
+
+
 def print_menu():
     """Print the main menu."""
     print("\n" + "="*70)
     print("DeepAgents Playground - Example Runner")
     print("="*70 + "\n")
     
-    print("LangChain Examples:")
-    for key, example in EXAMPLES["langchain"].items():
-        print(f"  {key}. {example['name']}")
-        print(f"     {example['description']}")
+    example_map = build_example_map()
     
-    print("\nLangGraph Examples:")
-    for key, example in EXAMPLES["langgraph"].items():
-        print(f"  {int(key) + 2}. {example['name']}")
-        print(f"     {example['description']}")
+    current_category = None
+    categories = {
+        1: "LangChain Examples:",
+        3: "\nLangGraph Examples:",
+        5: "\nDeep Agents Examples:"
+    }
     
-    print("\nDeep Agents Examples:")
-    for key, example in EXAMPLES["deepagents"].items():
-        print(f"  {int(key) + 4}. {example['name']}")
+    for num, example in example_map.items():
+        if num in categories:
+            print(categories[num])
+        print(f"  {num}. {example['name']}")
         print(f"     {example['description']}")
     
     print("\n  0. Exit")
     print("\n" + "="*70)
-
-
-def get_example_by_number(num: int):
-    """Get example information by number."""
-    if num == 1:
-        return EXAMPLES["langchain"]["1"]
-    elif num == 2:
-        return EXAMPLES["langchain"]["2"]
-    elif num == 3:
-        return EXAMPLES["langgraph"]["1"]
-    elif num == 4:
-        return EXAMPLES["langgraph"]["2"]
-    elif num == 5:
-        return EXAMPLES["deepagents"]["1"]
-    elif num == 6:
-        return EXAMPLES["deepagents"]["2"]
-    return None
 
 
 def run_example(example_info):
@@ -98,11 +95,15 @@ def run_example(example_info):
     print(f"Description: {example_info['description']}")
     print("-" * 70 + "\n")
     
-    # Import and run the example
+    # Execute the file safely using subprocess
     file_path = example_info['file']
     
-    # Execute the file
-    os.system(f"python {file_path}")
+    try:
+        subprocess.run([sys.executable, file_path], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\n❌ Error running example: {e}")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Example interrupted by user.")
 
 
 def check_environment():
@@ -125,11 +126,14 @@ def main():
     if not check_environment():
         return
     
+    example_map = build_example_map()
+    max_choice = len(example_map)
+    
     while True:
         print_menu()
         
         try:
-            choice = input("\nEnter your choice (0-6): ").strip()
+            choice = input(f"\nEnter your choice (0-{max_choice}): ").strip()
             
             if choice == "0":
                 print("\nThanks for using DeepAgents Playground! 👋")
@@ -137,11 +141,11 @@ def main():
             
             choice_num = int(choice)
             
-            if choice_num < 1 or choice_num > 6:
-                print("\n❌ Invalid choice. Please enter a number between 0 and 6.")
+            if choice_num < 1 or choice_num > max_choice:
+                print(f"\n❌ Invalid choice. Please enter a number between 0 and {max_choice}.")
                 continue
             
-            example = get_example_by_number(choice_num)
+            example = example_map.get(choice_num)
             
             if example:
                 run_example(example)
