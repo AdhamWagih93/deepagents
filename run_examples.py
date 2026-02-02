@@ -72,18 +72,24 @@ def print_menu():
     
     example_map = build_example_map()
     
-    current_category = None
-    categories = {
-        1: "LangChain Examples:",
-        3: "\nLangGraph Examples:",
-        5: "\nDeep Agents Examples:"
+    # Track categories for display
+    category_names = {
+        "langchain": "LangChain Examples:",
+        "langgraph": "LangGraph Examples:",
+        "deepagents": "Deep Agents Examples:"
     }
     
-    for num, example in example_map.items():
-        if num in categories:
-            print(categories[num])
-        print(f"  {num}. {example['name']}")
-        print(f"     {example['description']}")
+    # Build reverse mapping to track which category each number belongs to
+    current_category = None
+    num = 1
+    
+    for category in ["langchain", "langgraph", "deepagents"]:
+        print(f"\n{category_names[category]}")
+        for key in sorted(EXAMPLES[category].keys()):
+            example = EXAMPLES[category][key]
+            print(f"  {num}. {example['name']}")
+            print(f"     {example['description']}")
+            num += 1
     
     print("\n  0. Exit")
     print("\n" + "="*70)
