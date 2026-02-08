@@ -4,6 +4,7 @@ langchain-core>=0.3.0
 langchain-community>=0.3.0
 langchain-ollama>=0.2.0
 langgraph>=0.2.0
+langgraph-checkpoint-postgres>=2.0.0
 
 # LangSmith for tracing (optional but recommended)
 langsmith>=0.1.0
@@ -25,3 +26,7 @@ aiohttp>=3.9.0
 
 # Storage
 aiosqlite>=0.20.0
+psycopg2-binary>=2.9.0
+
+# Production server
+gunicorn>=21.0.0

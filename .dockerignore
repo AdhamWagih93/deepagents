@@ -1,0 +1,63 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+.venv
+venv
+ENV
+env
+.env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build
+dist
+*.whl
+
+# Documentation
+docs
+*.md
+!README.md
+
+# Tests
+tests
+test_*
+*_test.py
+.pytest_cache
+.coverage
+htmlcov
+
+# Local data
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Claude Code
+.claude
+
+# Misc
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Development scripts
+startup.ps1
