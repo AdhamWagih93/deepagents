@@ -170,6 +170,102 @@ class HistoryStore:
             )
         """)
 
+        # ============================================================================
+        # Secrets Management Tables
+        # ============================================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS secrets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                encrypted_value BLOB NOT NULL,
+                category TEXT DEFAULT 'general',
+                description TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ============================================================================
+        # Skills System Tables
+        # ============================================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                skill_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT,
+                is_builtin INTEGER DEFAULT 0,
+                ollama_generated INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_skills (
+                agent_id TEXT NOT NULL,
+                skill_id TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                PRIMARY KEY (agent_id, skill_id),
+                FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+            )
+        """)
+
+        # ============================================================================
+        # Observability Tables
+        # ============================================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS execution_traces (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                event_type TEXT NOT NULL,
+                data TEXT,
+                duration_ms REAL,
+                parent_id TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES sessions(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                metric_type TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                value REAL NOT NULL,
+                tags TEXT,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create indexes for better query performance
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_secrets_name ON secrets(name)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_secrets_category ON secrets(category)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_skills_type ON skills(skill_type)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_skills_builtin ON skills(is_builtin)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_conversation ON execution_traces(conversation_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_type ON execution_traces(event_type)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_metrics_type ON metrics(metric_type)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)
+        """)
+
         conn.commit()
         conn.close()
 

@@ -1,0 +1,104 @@
+# ============================================================================
+# DeepAgents .gitignore
+# ============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+deepagents_history.db
+
+# Local data
+data/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.temp
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Claude Code
+.claude/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Distribution / packaging
+*.manifest
+*.spec
+
+# Secrets (never commit these!)
+secrets.json
+credentials.json
+*.pem
+*.key
+
+# Environment files with secrets
+.env.local
+.env.production
+.env.*.local
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/

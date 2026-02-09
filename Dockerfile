@@ -1,6 +1,7 @@
 # ============================================================================
 # DeepAgents - Multistage Dockerfile
 # LangChain Agent Explorer with Ollama Integration
+# Includes: git, kubectl, podman CLIs for agent tools
 # ============================================================================
 
 # -----------------------------------------------------------------------------
@@ -32,7 +33,7 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
 
 # -----------------------------------------------------------------------------
-# Stage 2: Runtime - Minimal production image
+# Stage 2: Runtime - Production image with CLI tools
 # -----------------------------------------------------------------------------
 FROM python:3.11-slim as runtime
 
@@ -57,14 +58,34 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STREAMLIT_SERVER_PORT=8501 \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_HEADLESS=true \
-    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    # Kubernetes config
+    KUBECONFIG=/app/.kube/config
 
-# Install runtime dependencies only
+# Install runtime dependencies and CLI tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    ca-certificates \
+    gnupg \
+    git \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kubectl
+RUN curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg && \
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' > /etc/apt/sources.list.d/kubernetes.list && \
+    apt-get update && apt-get install -y kubectl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install podman (podman-remote for connecting to external podman)
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/Debian_12/Release.key | gpg --dearmor -o /etc/apt/keyrings/libcontainers.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/libcontainers.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/Debian_12/ /" > /etc/apt/sources.list.d/libcontainers.list && \
+    apt-get update && apt-get install -y podman-remote && \
+    ln -s /usr/bin/podman-remote /usr/bin/podman && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
 
 # Create non-root user for security
 RUN groupadd --gid 1000 deepagents && \
@@ -79,11 +100,17 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application code
 COPY --chown=deepagents:deepagents . .
 
-# Create data directory for persistent storage
-RUN mkdir -p /app/data && chown -R deepagents:deepagents /app/data
+# Create directories for persistent storage and configs
+RUN mkdir -p /app/data /app/.kube /app/.ssh && \
+    chown -R deepagents:deepagents /app/data /app/.kube /app/.ssh
 
 # Switch to non-root user
 USER deepagents
+
+# Configure git for the user
+RUN git config --global init.defaultBranch main && \
+    git config --global user.email "deepagents@local" && \
+    git config --global user.name "DeepAgents"
 
 # Expose Streamlit port
 EXPOSE 8501

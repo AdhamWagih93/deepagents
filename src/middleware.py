@@ -65,6 +65,82 @@ class MiddlewareType(Enum):
     CONTEXT_EDITING = "context_editing"
     SHELL_TOOL = "shell_tool"
     FILE_SEARCH = "file_search"
+    SECRET_INJECTION = "secret_injection"
+
+
+class SecretInjectionMiddleware:
+    """
+    Custom middleware for injecting secrets into tool execution.
+
+    This middleware:
+    1. Pre-execution: Loads required secrets into environment variables
+    2. Post-execution: Cleans up secrets and masks them in output logs
+    """
+
+    def __init__(self, secrets_manager=None, secret_names: List[str] = None):
+        """
+        Initialize the SecretInjectionMiddleware.
+
+        Args:
+            secrets_manager: SecretsManager instance for secret access
+            secret_names: List of secret names to inject
+        """
+        self.secrets_manager = secrets_manager
+        self.secret_names = secret_names or []
+        self._injected_secrets = {}
+        self._original_env = {}
+
+    def pre_execute(self):
+        """Inject secrets before tool execution."""
+        import os
+
+        if not self.secrets_manager:
+            return
+
+        for name in self.secret_names:
+            value = self.secrets_manager.get_secret(name)
+            if value:
+                # Store original value
+                self._original_env[name] = os.environ.get(name)
+                # Inject secret
+                os.environ[name] = value
+                self._injected_secrets[name] = value
+
+    def post_execute(self, output: str = "") -> str:
+        """Clean up secrets and mask in output."""
+        import os
+
+        # Restore original environment
+        for name in self._injected_secrets:
+            if self._original_env.get(name) is not None:
+                os.environ[name] = self._original_env[name]
+            else:
+                os.environ.pop(name, None)
+
+        # Mask secrets in output
+        masked_output = output
+        if self.secrets_manager:
+            masked_output = self.secrets_manager.mask_in_logs(output)
+
+        # Clear tracking
+        self._injected_secrets = {}
+        self._original_env = {}
+
+        return masked_output
+
+    def wrap_tool_call(self, tool_func, *args, **kwargs):
+        """Wrap a tool call with secret injection."""
+        self.pre_execute()
+        try:
+            result = tool_func(*args, **kwargs)
+            if isinstance(result, str):
+                result = self.post_execute(result)
+            else:
+                self.post_execute()
+            return result
+        except Exception as e:
+            self.post_execute()
+            raise
 
 
 @dataclass
@@ -236,6 +312,16 @@ MIDDLEWARE_CONFIGS: Dict[MiddlewareType, MiddlewareConfig] = {
             "max_file_size_mb": 10,
         }
     ),
+    MiddlewareType.SECRET_INJECTION: MiddlewareConfig(
+        middleware_type=MiddlewareType.SECRET_INJECTION,
+        name="SecretInjectionMiddleware",
+        description="Inject secrets into environment for tool execution and mask in output.",
+        priority=15,
+        options={
+            "secrets_manager": None,  # SecretsManager instance
+            "secret_names": [],  # List of secret names to inject
+        }
+    ),
 }
 
 
@@ -368,6 +454,12 @@ class MiddlewareFactory:
                 root_path=merged_options.get("root_path", "."),
                 use_ripgrep=merged_options.get("use_ripgrep", True),
                 max_file_size_mb=merged_options.get("max_file_size_mb", 10),
+            )
+
+        elif middleware_type == MiddlewareType.SECRET_INJECTION:
+            return SecretInjectionMiddleware(
+                secrets_manager=merged_options.get("secrets_manager"),
+                secret_names=merged_options.get("secret_names", []),
             )
 
         raise ValueError(f"Middleware type not implemented: {middleware_type}")

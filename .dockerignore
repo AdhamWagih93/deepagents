@@ -61,3 +61,5 @@ Thumbs.db
 
 # Development scripts
 startup.ps1
+docker_startup.ps1
+start_podman.sh

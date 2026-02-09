@@ -27,6 +27,7 @@ import logging
 import queue
 import shutil
 import sys
+import os
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Callable
@@ -66,6 +67,9 @@ from src.ollama_integration import (
 )
 from src.history import HistoryStore, InteractionTracker, ToolCallRecord, TodoRecord
 from src.tools import get_tool_registry, TOOL_PRESETS
+from src.secrets import SecretsManager, SecretInjector
+from src.skills import SkillEngine, SkillType, Skill, BUILTIN_SKILLS
+from src.observability import ObservabilityEngine, ExecutionTracer, MetricsCollector, EventType
 
 # LangChain imports
 from langchain.agents import create_agent
@@ -1163,11 +1167,51 @@ def init_session_state():
 
         # Detailed debug info for last agent call
         "last_agent_call_info": None,
+
+        # ===== Secrets Management =====
+        "secrets_manager": None,  # Initialized after db_path is known
+        "show_secret_modal": False,
+        "editing_secret": None,
+
+        # ===== Skills System =====
+        "skill_engine": None,  # Initialized after db_path is known
+        "show_skill_modal": False,
+        "editing_skill": None,
+        "skill_generation_prompt": "",
+
+        # ===== Observability =====
+        "observability_engine": None,  # Initialized after db_path is known
+        "show_traces": False,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    # Initialize managers that need database path
+    db_path = os.environ.get("HISTORY_DB_PATH", "deepagents_history.db")
+
+    if st.session_state.secrets_manager is None:
+        try:
+            st.session_state.secrets_manager = SecretsManager(db_path)
+        except Exception as e:
+            logger.warning(f"Failed to initialize SecretsManager: {e}")
+
+    if st.session_state.skill_engine is None:
+        try:
+            # Initialize with OllamaClient if available
+            ollama_client = None
+            if st.session_state.get("ollama_connected"):
+                ollama_client = OllamaClient(st.session_state.ollama_config)
+            st.session_state.skill_engine = SkillEngine(db_path, ollama_client)
+        except Exception as e:
+            logger.warning(f"Failed to initialize SkillEngine: {e}")
+
+    if st.session_state.observability_engine is None:
+        try:
+            st.session_state.observability_engine = ObservabilityEngine(db_path)
+        except Exception as e:
+            logger.warning(f"Failed to initialize ObservabilityEngine: {e}")
 
 
 def add_debug_event(phase: str, message: str, event_type: str = "info", error: Optional[str] = None):
@@ -2620,6 +2664,49 @@ def render_sidebar():
                                               index=["user", "admin", "developer"].index(ctx.user_role),
                                               label_visibility="collapsed", key="ctx_role")
 
+        # ===== Secrets Management Section =====
+        with st.expander("🔐 Secrets", expanded=False):
+            secrets_mgr = st.session_state.secrets_manager
+            if secrets_mgr:
+                secrets_list = secrets_mgr.list_secrets()
+
+                if secrets_list:
+                    st.markdown(f"**{len(secrets_list)} secrets stored**")
+                    for secret in secrets_list[:5]:  # Show first 5
+                        col_name, col_del = st.columns([4, 1])
+                        with col_name:
+                            st.markdown(f"🔑 `{secret.name}`")
+                        with col_del:
+                            if st.button("🗑️", key=f"del_secret_{secret.id}", help="Delete"):
+                                secrets_mgr.delete_secret(secret.name)
+                                st.rerun()
+
+                    if len(secrets_list) > 5:
+                        st.caption(f"...and {len(secrets_list) - 5} more")
+                else:
+                    st.caption("No secrets stored yet")
+
+                st.markdown("---")
+
+                # Add new secret form
+                with st.form("add_secret_form", clear_on_submit=True):
+                    new_name = st.text_input("Name", placeholder="API_KEY")
+                    new_value = st.text_input("Value", type="password", placeholder="sk-...")
+                    new_category = st.selectbox("Category", secrets_mgr.CATEGORIES)
+                    new_desc = st.text_input("Description", placeholder="Optional description")
+
+                    if st.form_submit_button("➕ Add Secret", use_container_width=True):
+                        if new_name and new_value:
+                            if secrets_mgr.set_secret(new_name, new_value, new_category, new_desc):
+                                st.success(f"Added secret: {new_name}")
+                                add_debug_event("SECRETS", f"Added secret: {new_name}")
+                            else:
+                                st.error("Failed to add secret")
+                        else:
+                            st.warning("Name and value are required")
+            else:
+                st.warning("Secrets manager not initialized")
+
         # Controls section at bottom
         st.markdown("---")
         st.markdown("""
@@ -2676,27 +2763,90 @@ def render_sidebar():
 # Conversation Management
 # ============================================================================
 
-def create_new_conversation(name: str = None, agent_id: str = None) -> str:
+def generate_conversation_title(first_message: str) -> str:
+    """Generate a concise title for the conversation using AI."""
+    try:
+        # Use a simple prompt to generate a short title
+        client = OllamaClient(st.session_state.ollama_config)
+        messages = [
+            {"role": "system", "content": "Generate a very short title (3-6 words max) for a conversation that starts with the following message. Reply with ONLY the title, nothing else. No quotes, no explanation."},
+            {"role": "user", "content": first_message[:500]}  # Limit input length
+        ]
+
+        # Collect the response
+        title_parts = []
+        for token in client.chat_streaming(messages):
+            title_parts.append(token)
+
+        title = "".join(title_parts).strip()
+
+        # Clean up the title - remove quotes if present
+        title = title.strip('"\'')
+
+        # Ensure reasonable length
+        if len(title) > 50:
+            title = title[:47] + "..."
+        elif not title:
+            title = first_message[:30] + ("..." if len(first_message) > 30 else "")
+
+        return title
+
+    except Exception as e:
+        logger.warning(f"Failed to generate conversation title: {e}")
+        # Fallback: use first 30 chars of message
+        return first_message[:30] + ("..." if len(first_message) > 30 else "")
+
+
+def auto_name_conversation(conv_id: str, first_message: str):
+    """Auto-generate and set the conversation name from the first message."""
+    if conv_id not in st.session_state.conversations:
+        return
+
+    conv = st.session_state.conversations[conv_id]
+
+    # Only auto-name if it's still the placeholder name
+    if conv.get("auto_named", False):
+        return
+
+    # Generate title
+    title = generate_conversation_title(first_message)
+
+    # Ensure uniqueness by appending number if needed
+    existing_names = {c.get("name") for c in st.session_state.conversations.values() if c["id"] != conv_id}
+    original_title = title
+    counter = 2
+    while title in existing_names:
+        title = f"{original_title} ({counter})"
+        counter += 1
+
+    # Update the conversation
+    conv["name"] = title
+    conv["auto_named"] = True
+    conv["updated_at"] = datetime.now().isoformat()
+
+    add_debug_event("CONVERSATION", f"Auto-named conversation: {title}")
+
+
+def create_new_conversation(agent_id: str = None) -> str:
     """Create a new conversation and return its ID."""
     conv_id = str(uuid.uuid4())[:8]
     agent_id = agent_id or st.session_state.active_agent_id
 
-    # Generate default name if not provided
-    if not name:
-        conv_count = len(st.session_state.conversations) + 1
-        name = f"Conversation {conv_count}"
+    # Use placeholder name - will be auto-generated after first message
+    placeholder_name = f"New Chat"
 
     st.session_state.conversations[conv_id] = {
         "id": conv_id,
-        "name": name,
+        "name": placeholder_name,
         "messages": [],
         "agent_id": agent_id,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
         "thread_id": str(uuid.uuid4()),
+        "auto_named": False,  # Track if name was auto-generated
     }
 
-    add_debug_event("CONVERSATION", f"Created new conversation: {name}")
+    add_debug_event("CONVERSATION", f"Created new conversation: {conv_id}")
     return conv_id
 
 
@@ -2945,19 +3095,20 @@ def render_chat_interface():
         active_conv_id = st.session_state.active_conversation_id
         if active_conv_id and active_conv_id in st.session_state.conversations:
             conv = st.session_state.conversations[active_conv_id]
-            conv_name = conv.get("name", "Unnamed")
-            # Editable conversation name
+            conv_name = conv.get("name", "New Chat")
+            # Read-only conversation name (auto-generated)
             col_name, col_agent = st.columns([2, 1])
             with col_name:
-                new_name = st.text_input(
-                    "Conversation name",
-                    value=conv_name,
-                    key="edit_conv_name",
-                    label_visibility="collapsed",
-                    placeholder="Conversation name..."
-                )
-                if new_name != conv_name:
-                    rename_conversation(active_conv_id, new_name)
+                st.markdown(f"""
+                <div style="padding: 0.5rem 0.75rem; background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+                            border-radius: 8px; border: 1px solid #e2e8f0;">
+                    <div style="font-weight: 600; color: #1e293b; font-size: 0.95rem;
+                                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+                         title="{conv_name}">
+                        💬 {conv_name}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
             with col_agent:
                 # Agent selector for this conversation
@@ -3056,9 +3207,9 @@ def render_chat_interface():
             with st.chat_message(msg["role"]):
                 # Display errors with error styling, normal messages with markdown
                 if msg.get("error"):
-                    error_content = msg.get("error", "Unknown error")
+                    error_content = msg.get("error") or "Unknown error"
                     # Check if it's a detailed diagnostic (contains markdown)
-                    if "**" in error_content or "```" in error_content:
+                    if error_content and ("**" in error_content or "```" in error_content):
                         st.markdown(error_content)
                     else:
                         st.error(f"❌ {error_content}")
@@ -3090,10 +3241,16 @@ def render_chat_interface():
 
         with col_input:
             if prompt := st.chat_input("Message..."):
+                # Track if this is the first message for auto-naming
+                is_first_message = False
+
                 # Create conversation if none exists
                 if not st.session_state.active_conversation_id:
                     conv_id = create_new_conversation()
                     st.session_state.active_conversation_id = conv_id
+                    is_first_message = True
+                elif not st.session_state.messages:
+                    is_first_message = True
 
                 # Quick connection check before sending
                 if st.session_state.ollama_connected is False:
@@ -3111,6 +3268,10 @@ def render_chat_interface():
                     "content": prompt,
                     "timestamp": datetime.now().isoformat(),
                 })
+
+                # Auto-name conversation on first message
+                if is_first_message and st.session_state.active_conversation_id:
+                    auto_name_conversation(st.session_state.active_conversation_id, prompt)
 
                 with st.chat_message("user"):
                     st.markdown(prompt)
@@ -4345,10 +4506,16 @@ def render_chat_workspace():
             active_conv_id = st.session_state.active_conversation_id
             if active_conv_id and active_conv_id in st.session_state.conversations:
                 conv = st.session_state.conversations[active_conv_id]
-                conv_name = st.text_input("", value=conv.get("name", "Conversation"),
-                                         key="conv_name_input", label_visibility="collapsed")
-                if conv_name != conv.get("name"):
-                    rename_conversation(active_conv_id, conv_name)
+                conv_name = conv.get("name", "New Chat")
+                # Display conversation name (read-only, auto-generated)
+                st.markdown(f"""
+                <div style="padding: 0.4rem 0.6rem; background: #f8fafc; border-radius: 6px;
+                            border: 1px solid #e2e8f0; font-weight: 500; font-size: 0.9rem;
+                            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+                     title="{conv_name}">
+                    💬 {conv_name}
+                </div>
+                """, unsafe_allow_html=True)
             else:
                 st.caption("No conversation selected")
 
@@ -4455,6 +4622,66 @@ def render_chat_workspace():
                         if parts:
                             st.caption(" | ".join(parts))
 
+        # Quick Actions Bar
+        st.markdown("""
+        <div style="display: flex; gap: 0.5rem; padding: 0.5rem 0; border-top: 1px solid #e2e8f0; margin-bottom: 0.5rem;">
+        </div>
+        """, unsafe_allow_html=True)
+        action_cols = st.columns([1, 1, 1, 1, 1, 3])
+        with action_cols[0]:
+            if st.button("🗑️ Clear", key="quick_clear", help="Clear chat (Ctrl+L)", use_container_width=True):
+                st.session_state.messages = []
+                st.session_state.current_steps = []
+                st.session_state.tool_calls = []
+                save_current_conversation()
+                st.rerun()
+        with action_cols[1]:
+            if st.button("📥 Export", key="quick_export", help="Export conversation", use_container_width=True):
+                if st.session_state.messages:
+                    export_data = {
+                        "conversation_id": st.session_state.active_conversation_id,
+                        "messages": st.session_state.messages,
+                        "exported_at": datetime.now().isoformat(),
+                    }
+                    st.download_button(
+                        "💾 Download JSON",
+                        json.dumps(export_data, indent=2, default=str),
+                        f"conversation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        "application/json",
+                        key="export_download"
+                    )
+        with action_cols[2]:
+            if st.button("🔄 New", key="quick_new", help="New conversation", use_container_width=True):
+                save_current_conversation()
+                st.session_state.active_conversation_id = None
+                st.session_state.messages = []
+                st.rerun()
+        with action_cols[3]:
+            show_traces = st.toggle("📊", key="toggle_traces", help="Show execution traces")
+            st.session_state.show_traces = show_traces
+        with action_cols[4]:
+            # Connection status indicator
+            if st.session_state.ollama_connected:
+                st.markdown("🟢 **Connected**")
+            else:
+                st.markdown("🔴 **Offline**")
+
+        # Show execution traces if toggled
+        if st.session_state.get("show_traces") and st.session_state.observability_engine:
+            with st.expander("📊 Execution Traces", expanded=True):
+                conv_id = st.session_state.active_conversation_id
+                if conv_id:
+                    traces = st.session_state.observability_engine.tracer.get_traces(conv_id, limit=20)
+                    if traces:
+                        for trace in traces[:5]:
+                            event_icon = {"tool_call": "🔧", "llm_request": "🧠", "error": "❌"}.get(trace.get("event_type", ""), "📍")
+                            duration = trace.get("duration_ms", 0) or 0
+                            st.markdown(f"{event_icon} **{trace.get('event_type')}** - {duration:.0f}ms")
+                    else:
+                        st.caption("No traces yet")
+                else:
+                    st.caption("Start a conversation to see traces")
+
         # Chat input
         col_input, col_mode = st.columns([5, 1])
         with col_mode:
@@ -4462,15 +4689,23 @@ def render_chat_workspace():
                                     key="workspace_send_mode", label_visibility="collapsed")
         with col_input:
             if prompt := st.chat_input("Message...", key="workspace_chat_input"):
+                is_first_message = False
                 if not st.session_state.active_conversation_id:
                     conv_id = create_new_conversation()
                     st.session_state.active_conversation_id = conv_id
+                    is_first_message = True
+                elif not st.session_state.messages:
+                    is_first_message = True
 
                 if st.session_state.ollama_connected is False:
                     st.error("❌ Ollama not connected")
                 else:
                     st.session_state.messages.append({"role": "user", "content": prompt})
                     save_current_conversation()
+
+                    # Auto-name conversation on first message
+                    if is_first_message and st.session_state.active_conversation_id:
+                        auto_name_conversation(st.session_state.active_conversation_id, prompt)
 
                     if send_mode == "Background":
                         task_id = send_background_prompt(prompt)
@@ -4866,6 +5101,355 @@ def render_agent_studio():
 
 
 # ============================================================================
+# Skills Library Tab
+# ============================================================================
+
+def render_skills_library():
+    """Render the Skills Library tab."""
+    st.markdown("""
+    <div style="margin-bottom: 1.5rem;">
+        <h2 style="margin: 0; color: #1e293b;">🧠 Skills Library</h2>
+        <p style="color: #64748b; margin-top: 0.25rem;">
+            Create, manage, and assign agentic skills to enhance your agents
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    skill_engine = st.session_state.skill_engine
+    if not skill_engine:
+        st.warning("Skills engine not initialized. Please check database connection.")
+        return
+
+    # Top action bar
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        search_query = st.text_input("🔍 Search skills", placeholder="Search by name, tags...", key="skill_search")
+    with col2:
+        filter_type = st.selectbox("Filter by type", ["All Types", "Prompt Templates", "Tool Bundles", "Workflows"], key="skill_type_filter")
+    with col3:
+        st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        if st.button("➕ Create Skill", use_container_width=True, type="primary"):
+            st.session_state.show_skill_modal = True
+
+    st.markdown("---")
+
+    # Get skills based on filter
+    type_map = {
+        "Prompt Templates": SkillType.PROMPT_TEMPLATE,
+        "Tool Bundles": SkillType.TOOL_BUNDLE,
+        "Workflows": SkillType.WORKFLOW,
+    }
+    skill_type_filter = type_map.get(filter_type) if filter_type != "All Types" else None
+
+    if search_query:
+        skills = skill_engine.search_skills(search_query)
+    else:
+        skills = skill_engine.list_skills(skill_type=skill_type_filter)
+
+    # Display skills in grid
+    if not skills:
+        st.info("No skills found. Create your first skill or generate one with AI!")
+    else:
+        # Group by type
+        builtin_skills = [s for s in skills if s.is_builtin]
+        custom_skills = [s for s in skills if not s.is_builtin]
+
+        if builtin_skills:
+            st.markdown("### 📦 Built-in Skills")
+            cols = st.columns(3)
+            for idx, skill in enumerate(builtin_skills):
+                with cols[idx % 3]:
+                    render_skill_card(skill, skill_engine)
+
+        if custom_skills:
+            st.markdown("### 🎨 Custom Skills")
+            cols = st.columns(3)
+            for idx, skill in enumerate(custom_skills):
+                with cols[idx % 3]:
+                    render_skill_card(skill, skill_engine)
+
+    # Create Skill Modal
+    if st.session_state.get("show_skill_modal"):
+        render_skill_creation_modal(skill_engine)
+
+
+def render_skill_card(skill: Skill, skill_engine):
+    """Render a skill card."""
+    type_icons = {
+        SkillType.PROMPT_TEMPLATE: "📝",
+        SkillType.TOOL_BUNDLE: "🔧",
+        SkillType.WORKFLOW: "🔄",
+    }
+    type_colors = {
+        SkillType.PROMPT_TEMPLATE: "#6366f1",
+        SkillType.TOOL_BUNDLE: "#10b981",
+        SkillType.WORKFLOW: "#f59e0b",
+    }
+
+    icon = type_icons.get(skill.skill_type, "📦")
+    color = type_colors.get(skill.skill_type, "#64748b")
+    builtin_badge = "🏷️ Built-in" if skill.is_builtin else ""
+    ai_badge = "🤖 AI-Generated" if skill.ollama_generated else ""
+
+    st.markdown(f"""
+    <div style="background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1rem;
+                margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+        <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+            <span style="font-size: 1.5rem;">{icon}</span>
+            <span style="background: {color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem;">
+                {skill.skill_type.value.replace('_', ' ').title()}
+            </span>
+        </div>
+        <h4 style="margin: 0.5rem 0; color: #1e293b;">{skill.name}</h4>
+        <p style="color: #64748b; font-size: 0.85rem; margin: 0.5rem 0;">{skill.description[:100]}{'...' if len(skill.description) > 100 else ''}</p>
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem;">
+            {''.join([f'<span style="background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; color: #64748b;">#{tag}</span>' for tag in skill.tags[:3]])}
+        </div>
+        <div style="font-size: 0.7rem; color: #94a3b8; margin-top: 0.5rem;">{builtin_badge} {ai_badge}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Action buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📋 View", key=f"view_{skill.id}", use_container_width=True):
+            st.session_state.editing_skill = skill.id
+    with col2:
+        if st.session_state.active_agent_id:
+            if st.button("➕ Assign", key=f"assign_{skill.id}", use_container_width=True):
+                skill_engine.assign_skill(st.session_state.active_agent_id, skill.id)
+                st.success(f"Assigned '{skill.name}' to agent")
+                add_debug_event("SKILLS", f"Assigned skill {skill.name} to active agent")
+
+
+def render_skill_creation_modal(skill_engine):
+    """Render the skill creation modal."""
+    st.markdown("### ➕ Create New Skill")
+
+    creation_mode = st.radio("Creation Mode", ["✍️ Manual", "🤖 AI Generate"], horizontal=True, key="skill_creation_mode")
+
+    if creation_mode == "🤖 AI Generate":
+        st.markdown("**Describe the skill you want to create:**")
+        description = st.text_area(
+            "Skill Description",
+            placeholder="e.g., An expert Python debugger that systematically finds and fixes bugs...",
+            height=100,
+            key="skill_gen_desc",
+            label_visibility="collapsed"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🧠 Generate with Ollama", use_container_width=True, type="primary", disabled=not description):
+                if description:
+                    with st.spinner("Generating skill with AI..."):
+                        skill = skill_engine.generate_skill_from_description(description)
+                        if skill:
+                            st.success(f"Created skill: {skill.name}")
+                            st.session_state.show_skill_modal = False
+                            add_debug_event("SKILLS", f"AI-generated skill: {skill.name}")
+                            st.rerun()
+                        else:
+                            st.error("Failed to generate skill. Check Ollama connection.")
+        with col2:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state.show_skill_modal = False
+                st.rerun()
+    else:
+        # Manual creation form
+        with st.form("create_skill_form"):
+            name = st.text_input("Skill Name", placeholder="My Custom Skill")
+            description = st.text_area("Description", placeholder="What does this skill do?")
+            skill_type = st.selectbox("Type", [
+                ("Prompt Template", SkillType.PROMPT_TEMPLATE),
+                ("Tool Bundle", SkillType.TOOL_BUNDLE),
+                ("Workflow", SkillType.WORKFLOW),
+            ], format_func=lambda x: x[0])
+
+            tags_input = st.text_input("Tags (comma-separated)", placeholder="python, debugging, code")
+
+            # Type-specific content
+            st.markdown("**Skill Content:**")
+            if skill_type[1] == SkillType.PROMPT_TEMPLATE:
+                prompt_addition = st.text_area("System Prompt Addition", height=150,
+                    placeholder="You are an expert in...")
+                content = {"system_prompt_addition": prompt_addition, "example_exchanges": []}
+
+            elif skill_type[1] == SkillType.TOOL_BUNDLE:
+                registry = get_tool_registry()
+                selected_tools = st.multiselect("Select Tools", list(registry.keys()))
+                prompt_context = st.text_area("Context for Tools", placeholder="You have access to...")
+                content = {"tools": selected_tools, "tool_config": {}, "prompt_context": prompt_context}
+
+            else:  # Workflow
+                steps_text = st.text_area("Workflow Steps (one per line)", height=150,
+                    placeholder="analyze: Understand the task\nplan: Create a plan\nexecute: Execute the plan")
+                steps = []
+                for line in steps_text.strip().split("\n"):
+                    if ":" in line:
+                        action, prompt = line.split(":", 1)
+                        steps.append({"action": action.strip(), "prompt": prompt.strip()})
+                content = {"steps": steps, "fallback_behavior": "retry_with_feedback"}
+
+            col1, col2 = st.columns(2)
+            with col1:
+                submitted = st.form_submit_button("✅ Create Skill", use_container_width=True, type="primary")
+            with col2:
+                if st.form_submit_button("❌ Cancel", use_container_width=True):
+                    st.session_state.show_skill_modal = False
+                    st.rerun()
+
+            if submitted and name:
+                tags = [t.strip() for t in tags_input.split(",") if t.strip()]
+                skill = skill_engine.create_skill(name, skill_type[1], content, description, tags)
+                if skill:
+                    st.success(f"Created skill: {name}")
+                    st.session_state.show_skill_modal = False
+                    add_debug_event("SKILLS", f"Created skill: {name}")
+                    st.rerun()
+
+
+# ============================================================================
+# Observability Dashboard Tab
+# ============================================================================
+
+def render_observability_dashboard():
+    """Render the Observability Dashboard tab."""
+    st.markdown("""
+    <div style="margin-bottom: 1.5rem;">
+        <h2 style="margin: 0; color: #1e293b;">📈 Observability Dashboard</h2>
+        <p style="color: #64748b; margin-top: 0.25rem;">
+            Monitor agent performance, execution traces, and system metrics
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    obs_engine = st.session_state.observability_engine
+    if not obs_engine:
+        st.warning("Observability engine not initialized. Please check database connection.")
+        return
+
+    # Time range selector
+    time_range = st.selectbox("Time Range", ["Last 1 Hour", "Last 6 Hours", "Last 24 Hours", "Last 7 Days"],
+                               index=2, key="obs_time_range")
+    hours_map = {"Last 1 Hour": 1, "Last 6 Hours": 6, "Last 24 Hours": 24, "Last 7 Days": 168}
+    hours = hours_map[time_range]
+
+    # Get dashboard data
+    dashboard_data = obs_engine.metrics.get_dashboard_data(hours)
+
+    # Summary cards
+    st.markdown("### 📊 Summary")
+    cols = st.columns(5)
+
+    with cols[0]:
+        st.metric("Total Requests", dashboard_data["summary"].get("total_requests", 0))
+    with cols[1]:
+        avg_latency = dashboard_data["summary"].get("avg_latency_ms", 0)
+        st.metric("Avg Latency", f"{avg_latency:.0f}ms")
+    with cols[2]:
+        tokens_in = dashboard_data["summary"].get("total_tokens_in", 0)
+        st.metric("Tokens In", f"{tokens_in:,}")
+    with cols[3]:
+        tokens_out = dashboard_data["summary"].get("total_tokens_out", 0)
+        st.metric("Tokens Out", f"{tokens_out:,}")
+    with cols[4]:
+        error_count = sum(dashboard_data.get("error_breakdown", {}).values())
+        st.metric("Errors", error_count)
+
+    st.markdown("---")
+
+    # Charts row
+    chart_cols = st.columns(2)
+
+    with chart_cols[0]:
+        st.markdown("#### 🔧 Tool Usage")
+        tool_usage = dashboard_data.get("tool_usage", {})
+        if tool_usage:
+            tool_df = pd.DataFrame([
+                {"Tool": tool, "Calls": count}
+                for tool, count in sorted(tool_usage.items(), key=lambda x: x[1], reverse=True)[:10]
+            ])
+            st.bar_chart(tool_df.set_index("Tool"))
+        else:
+            st.info("No tool usage data yet")
+
+    with chart_cols[1]:
+        st.markdown("#### ⏱️ Latency Distribution")
+        percentiles = dashboard_data.get("latency_percentiles", {})
+        if percentiles:
+            latency_df = pd.DataFrame([
+                {"Percentile": k, "Latency (ms)": v}
+                for k, v in percentiles.items() if k.startswith("p")
+            ])
+            if not latency_df.empty:
+                st.bar_chart(latency_df.set_index("Percentile"))
+        else:
+            st.info("No latency data yet")
+
+    st.markdown("---")
+
+    # Activity timeline
+    st.markdown("#### 📈 Activity Timeline")
+    hourly_activity = dashboard_data.get("hourly_activity", [])
+    if hourly_activity:
+        activity_df = pd.DataFrame(hourly_activity)
+        if not activity_df.empty and "hour" in activity_df.columns:
+            st.line_chart(activity_df.set_index("hour")[["requests"]])
+    else:
+        st.info("No activity data yet")
+
+    st.markdown("---")
+
+    # Recent errors
+    st.markdown("#### ❌ Recent Errors")
+    error_breakdown = dashboard_data.get("error_breakdown", {})
+    if error_breakdown:
+        for error_type, count in error_breakdown.items():
+            st.markdown(f"- **{error_type}**: {count} occurrences")
+
+        # Get detailed error traces
+        recent_errors = obs_engine.tracer.get_recent_errors(10)
+        if recent_errors:
+            with st.expander("View Error Details", expanded=False):
+                for error in recent_errors:
+                    st.markdown(f"**{error.get('timestamp', 'Unknown time')}** - {error.get('event_type', 'error')}")
+                    st.json(error.get("data", {}))
+    else:
+        st.success("No errors in the selected time range!")
+
+    st.markdown("---")
+
+    # Execution Traces for active conversation
+    st.markdown("#### 🔍 Execution Traces")
+    conv_id = st.session_state.get("active_conversation_id")
+    if conv_id:
+        traces = obs_engine.tracer.get_traces(conv_id, limit=50)
+        if traces:
+            for trace in traces[:10]:
+                event_icon = {"tool_call": "🔧", "llm_request": "🧠", "error": "❌", "middleware": "⚙️"}.get(trace.get("event_type", ""), "📍")
+                status_color = "green" if trace.get("status") == "completed" else "red" if trace.get("status") == "error" else "orange"
+                duration = trace.get("duration_ms", 0) or 0
+
+                with st.expander(f"{event_icon} {trace.get('event_type', 'Unknown')} - {duration:.0f}ms", expanded=False):
+                    st.markdown(f"**Status:** :{status_color}[{trace.get('status', 'unknown')}]")
+                    st.markdown(f"**Time:** {trace.get('timestamp', 'Unknown')}")
+                    st.json(trace.get("data", {}))
+        else:
+            st.info("No traces for the current conversation")
+    else:
+        st.info("Select or start a conversation to see execution traces")
+
+    # Cleanup button
+    st.markdown("---")
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("🧹 Cleanup Old Data", help="Remove data older than 30 days"):
+            result = obs_engine.cleanup(days=30)
+            st.success(f"Cleaned up {result['traces_deleted']} traces and {result['metrics_deleted']} metrics")
+
+
+# ============================================================================
 # Main Application
 # ============================================================================
 
@@ -4894,10 +5478,12 @@ def main():
     # Top bar (replaces sidebar)
     render_top_bar()
 
-    # Main tabs - simplified to two main views
+    # Main tabs - with Skills Library and Observability
     tabs = st.tabs([
         "🎨 Agent Studio",
         "💬 Chat Workspace",
+        "🧠 Skills Library",
+        "📈 Observability",
         "⏰ Schedule",
         "📊 History & Analytics"
     ])
@@ -4909,9 +5495,15 @@ def main():
         render_chat_workspace()
 
     with tabs[2]:
-        scheduled_prompts_fragment()
+        render_skills_library()
 
     with tabs[3]:
+        render_observability_dashboard()
+
+    with tabs[4]:
+        scheduled_prompts_fragment()
+
+    with tabs[5]:
         history_fragment()
 
     # Compact footer
